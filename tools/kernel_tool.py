@@ -195,9 +195,6 @@ def _rpc_server_loop(
                 except Exception as exc:
                     logger.error("Kernel RPC tool call failed: %s", exc, exc_info=True)
                     result = tool_error(str(exc))
-                # Audit log: record tool name + args preview + duration.
-                # Surfaced in the kernel_execute result so transcript review
-                # (Codex, audit) can see exactly what the kernel did.
                 tool_call_log.append({
                     "tool": tool_name,
                     "args_preview": str(tool_args)[:80],
@@ -218,35 +215,13 @@ def _rpc_server_loop(
 # Kernel creation + stub injection
 # ---------------------------------------------------------------------------
 
-def _check_kernel_memory(km) -> bool:
-    """Return True if kernel RSS is under the memory limit, False to restart."""
-    try:
-        import psutil
-        info = km.get_connection_info()
-        pid = info.get("pid") if isinstance(info, dict) else None
-        if pid:
-            rss_mb = psutil.Process(pid).memory_info().rss / (1024 * 1024)
-            return rss_mb <= _KERNEL_MEMORY_LIMIT_MB
-    except Exception:
-        pass
-    return True  # can't check — assume OK
-
-
 def _get_or_create_kernel(task_id, enabled_tools):
     """Get existing kernel for this session, or create one."""
     with _kernel_lock:
         if task_id in _kernel_sessions:
             session = _kernel_sessions[task_id]
             session["last_used"] = time.time()
-            # Auto-restart if the kernel has grown past the memory limit
-            if not _check_kernel_memory(session["km"]):
-                logger.warning(
-                    "Kernel for %s exceeded %dMB, restarting",
-                    task_id, _KERNEL_MEMORY_LIMIT_MB,
-                )
-                _cleanup_kernel(task_id)
-            else:
-                return session
+            return session
         _ensure_cleanup_thread()
 
     from jupyter_client import KernelManager
@@ -308,7 +283,7 @@ def _get_or_create_kernel(task_id, enabled_tools):
     # Start RPC server thread
     stop_event = threading.Event()
     tool_call_counter = [0]
-    tool_call_log = []  # audit trail of every tool call the kernel made
+    tool_call_log = []
     rpc_thread = threading.Thread(
         target=_rpc_server_loop,
         args=(server_sock, task_id, tool_call_counter, 50,
@@ -337,10 +312,7 @@ def _get_or_create_kernel(task_id, enabled_tools):
 # ---------------------------------------------------------------------------
 
 def kernel_execute(code, task_id=None, enabled_tools=None, timeout=120, restart=False):
-    """Execute Python in the persistent kernel. State survives across calls.
-    
-    If restart=True, kill and recreate the kernel first (drops all state).
-    """
+    """Execute Python in the persistent kernel. State survives across calls."""
     if not task_id:
         return tool_error("kernel_execute requires a session context (task_id)")
 
@@ -399,17 +371,19 @@ def kernel_execute(code, task_id=None, enabled_tools=None, timeout=120, restart=
                         pass
                     status = "interrupted"
                     break
+
                 if touch_activity_if_due is not None:
                     try:
                         touch_activity_if_due(_activity_state, "kernel_execute running")
                     except Exception:
                         pass
+
                 try:
-                    msg = kc.get_iopub_msg(timeout=0.5)
+                    msg = kc.get_iopub_msg(timeout=2)
                 except Exception:
                     if not got_reply:
                         try:
-                            reply = kc.get_shell_msg(timeout=0.5)
+                            reply = kc.get_shell_msg(timeout=1)
                             if reply and reply.get("parent_header", {}).get("msg_id") == msg_id:
                                 got_reply = True
                         except Exception:
@@ -418,6 +392,61 @@ def kernel_execute(code, task_id=None, enabled_tools=None, timeout=120, restart=
                         break
                     continue
 
+                mt = msg.get("msg_type", "")
+                ct = msg.get("content", {})
+                if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                    continue
+
+                if mt == "stream":
+                    if ct.get("name") == "stderr":
+                        stderr_chunks.append(ct.get("text", ""))
+                    else:
+                        stdout_chunks.append(ct.get("text", ""))
+                elif mt == "execute_result":
+                    stdout_chunks.append(ct.get("data", {}).get("text/plain", ""))
+                elif mt == "error":
+                    stderr_chunks.append("\n".join(ct.get("traceback", [])))
+                elif mt == "status" and ct.get("execution_state") == "idle":
+                    # Don't break yet — keep draining for stream messages
+                    # that may arrive after idle for fast-executing code.
+                    got_reply = True
+                    # Continue draining for up to 5 more seconds
+                    drain_deadline = time.time() + 5.0
+                    while time.time() < drain_deadline:
+                        try:
+                            msg2 = kc.get_iopub_msg(timeout=1)
+                        except Exception:
+                            break
+                        mt2 = msg2.get("msg_type", "")
+                        ct2 = msg2.get("content", {})
+                        if msg2.get("parent_header", {}).get("msg_id") != msg_id:
+                            continue
+                        if mt2 == "stream":
+                            if ct2.get("name") == "stderr":
+                                stderr_chunks.append(ct2.get("text", ""))
+                            else:
+                                stdout_chunks.append(ct2.get("text", ""))
+                        elif mt2 == "execute_result":
+                            stdout_chunks.append(ct2.get("data", {}).get("text/plain", ""))
+                        elif mt2 == "error":
+                            stderr_chunks.append("\n".join(ct2.get("traceback", [])))
+                    break
+
+            if status != "interrupted" and time.time() >= deadline:
+                try:
+                    km.interrupt_kernel()
+                except Exception:
+                    pass
+                status = "timeout"
+
+            # Final drain pass — catches any straggler messages that arrived
+            # after the idle status. 3 second max.
+            final_drain_deadline = time.time() + 3.0
+            while time.time() < final_drain_deadline:
+                try:
+                    msg = kc.get_iopub_msg(timeout=0.5)
+                except Exception:
+                    break
                 mt = msg.get("msg_type", "")
                 ct = msg.get("content", {})
                 if msg.get("parent_header", {}).get("msg_id") != msg_id:
@@ -431,25 +460,10 @@ def kernel_execute(code, task_id=None, enabled_tools=None, timeout=120, restart=
                     stdout_chunks.append(ct.get("data", {}).get("text/plain", ""))
                 elif mt == "error":
                     stderr_chunks.append("\n".join(ct.get("traceback", [])))
-                elif mt == "status" and ct.get("execution_state") == "idle":
-                    if not got_reply:
-                        try:
-                            kc.get_shell_msg(timeout=2)
-                        except Exception:
-                            pass
-                    break
-
-            if status != "interrupted" and time.time() >= deadline:
-                try:
-                    km.interrupt_kernel()
-                except Exception:
-                    pass
-                status = "timeout"
 
             session["last_used"] = time.time()
             duration = round(time.monotonic() - exec_start, 2)
 
-            # Assemble + process output
             stdout_text = strip_ansi("".join(stdout_chunks))
             stderr_text = strip_ansi("".join(stderr_chunks))
             stdout_text = redact_sensitive_text(stdout_text, code_file=True)
@@ -504,7 +518,7 @@ def cleanup_session_kernel(task_id: str):
 
 
 def get_kernel_status():
-    """Return status of all active kernels (for /kernel command)."""
+    """Return status of all active kernels (for debugging/management)."""
     with _kernel_lock:
         return [
             {
@@ -517,59 +531,6 @@ def get_kernel_status():
         ]
 
 
-def restart_kernel(task_id, enabled_tools=None):
-    """Restart the kernel for a session (drops all state)."""
-    _cleanup_kernel(task_id)
-    if enabled_tools:
-        _get_or_create_kernel(task_id, enabled_tools)
-    return {"status": "restarted", "task_id": task_id}
-
-
-def list_kernel_variables(task_id):
-    """List variables in the kernel namespace (for /kernel command)."""
-    with _kernel_lock:
-        session = _kernel_sessions.get(task_id)
-    if not session:
-        return {"error": "No active kernel for this session"}
-    kc = session["kc"]
-    with session["lock"]:
-        msg_id = kc.execute(
-            "import sys, json\n"
-            "_vars = {k: type(v).__name__ for k, v in globals().items()\n"
-            "         if not k.startswith('_') and k not in ('In', 'Out', 'exit', 'quit', 'get_ipython')}\n"
-            "print(json.dumps(_vars))\n",
-            silent=False,
-        )
-        while True:
-            try:
-                msg = kc.get_iopub_msg(timeout=5)
-            except Exception:
-                break
-            if msg.get("parent_header", {}).get("msg_id") != msg_id:
-                continue
-            mt = msg.get("msg_type", "")
-            ct = msg.get("content", {})
-            if mt == "stream":
-                import json as _json
-                text = ct.get("text", "").strip()
-                if text:
-                    try:
-                        return _json.loads(text)
-                    except _json.JSONDecodeError:
-                        pass
-            elif mt == "execute_result":
-                import json as _json
-                text = ct.get("data", {}).get("text/plain", "").strip()
-                if text:
-                    try:
-                        return _json.loads(text)
-                    except _json.JSONDecodeError:
-                        pass
-            elif mt == "status" and ct.get("execution_state") == "idle":
-                break
-    return {}
-
-
 # ---------------------------------------------------------------------------
 # Requirements check + schema + registration
 # ---------------------------------------------------------------------------
@@ -580,7 +541,6 @@ def check_kernel_requirements():
         import ipykernel  # noqa: F401
         return True
     except ImportError:
-        # Try lazy-install before declaring unavailable
         try:
             from tools.lazy_deps import ensure
             ensure("exec.kernel", prompt=False)
@@ -604,7 +564,7 @@ _SCHEMA_DESCRIPTION = (
     "read_file, write_file, search_files, patch, terminal. "
     "Print results to stdout. "
     "Limits: 120s timeout, 50KB stdout cap, max 50 tool calls per session. "
-    "Use /kernel to inspect, clear, or restart the kernel."
+    "Pass restart=True to drop all state and start fresh."
 )
 
 registry.register(
@@ -622,7 +582,7 @@ registry.register(
                 },
                 "restart": {
                     "type": "boolean",
-                    "description": "If true, restart the kernel first (drops all state). Use when previous state is stale or causing errors.",
+                    "description": "If true, restart the kernel first (drops all state).",
                     "default": False,
                 },
                 "timeout": {
