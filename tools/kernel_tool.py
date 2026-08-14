@@ -407,20 +407,24 @@ def kernel_execute(code, task_id=None, enabled_tools=None, timeout=120, restart=
                 elif mt == "error":
                     stderr_chunks.append("\n".join(ct.get("traceback", [])))
                 elif mt == "status" and ct.get("execution_state") == "idle":
-                    # Don't break yet — keep draining for stream messages
-                    # that may arrive after idle for fast-executing code.
                     got_reply = True
-                    # Continue draining for up to 5 more seconds
-                    drain_deadline = time.time() + 5.0
+                    # Drain for up to 3 more seconds to catch stream messages
+                    # that arrive after idle for fast-executing code.
+                    # Don't break on get_iopub_msg timeout — keep draining
+                    # until the deadline or until we see a message for a
+                    # different execution (kernel moved on).
+                    drain_deadline = time.time() + 3.0
                     while time.time() < drain_deadline:
                         try:
-                            msg2 = kc.get_iopub_msg(timeout=1)
+                            msg2 = kc.get_iopub_msg(timeout=0.5)
                         except Exception:
-                            break
+                            # Timeout = no message right now, keep draining
+                            continue
                         mt2 = msg2.get("msg_type", "")
                         ct2 = msg2.get("content", {})
                         if msg2.get("parent_header", {}).get("msg_id") != msg_id:
-                            continue
+                            # Message for a different execution — kernel moved on
+                            break
                         if mt2 == "stream":
                             if ct2.get("name") == "stderr":
                                 stderr_chunks.append(ct2.get("text", ""))
