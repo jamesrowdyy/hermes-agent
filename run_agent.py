@@ -4327,6 +4327,13 @@ class AIAgent:
         except Exception:
             pass
 
+        # 2b. Clean persistent kernel sessions
+        try:
+            from tools.kernel_tool import cleanup_session_kernel
+            cleanup_session_kernel(task_id)
+        except Exception:
+            pass
+
         # 3. Clean browser daemon sessions
         try:
             cleanup_browser(task_id)

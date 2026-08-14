@@ -71,7 +71,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task",
+    "execute_code", "kernel_execute", "delegate_task",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -292,7 +292,7 @@ TOOLSETS = {
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
-        "tools": ["execute_code"],
+        "tools": ["execute_code", "kernel_execute"],
         "includes": []
     },
     

@@ -202,6 +202,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
 
+    # ─── Code execution: persistent kernel (kernel_execute tool) ───────────
+    # jupyter_client + ipykernel back the persistent IPython kernel tool.
+    # Lazy-installed on first kernel_execute when the packages are missing.
+    # Keep in sync with the `kernel` extra in pyproject.toml.
+    "exec.kernel": (
+        "jupyter_client==8.9.1",
+        "ipykernel==7.3.0",
+    ),
+
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
