@@ -8,7 +8,7 @@ import {
   tailBoundedRemend
 } from '@assistant-ui/react-streamdown'
 import type { code as streamdownCode } from '@streamdown/code'
-import { type ComponentProps, isValidElement, memo, type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ComponentProps, isValidElement, memo, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { defaultRemarkPlugins } from 'streamdown'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
@@ -165,6 +165,26 @@ function MediaPlaybackAttachment({ path }: { path: string }) {
   const { open, openFailed } = useOpenMediaFile(path)
   const kind = mediaKind(path)
   const name = mediaName(path)
+  // Electron's renderer never services macOS's native media-controls fullscreen
+  // button (the AVKit-style overlay path is a silent no-op in our windows), so
+  // we drive HTML5 fullscreen ourselves: a labeled button in the header row
+  // plus double-click on the video. requestFullscreen works fine in our
+  // frameless windows.
+  const wrapRef = useRef<HTMLSpanElement>(null)
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen()
+
+      return
+    }
+
+    const element = wrapRef.current?.querySelector('video')
+
+    void element?.requestFullscreen().catch(() => {
+      // Fullscreen denied (e.g. window without a screen) — stay inline quietly.
+    })
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -220,11 +240,21 @@ function MediaPlaybackAttachment({ path }: { path: string }) {
 
   if (kind === 'video' && src) {
     return (
-      <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
-        <span className="mb-2 block truncate text-xs font-medium text-muted-foreground">{name}</span>
+      <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3" ref={wrapRef}>
+        <span className="mb-2 flex items-center justify-between gap-2">
+          <span className="truncate text-xs font-medium text-muted-foreground">{name}</span>
+          <button
+            className="ref shrink-0 text-xs font-medium text-muted-foreground hover:text-foreground"
+            onClick={toggleFullscreen}
+            type="button"
+          >
+            Fullscreen
+          </button>
+        </span>
         <TranscriptVideo
           className="block max-h-112 w-full rounded-lg bg-black"
           controls
+          onDoubleClick={toggleFullscreen}
           onError={() => setFailed(true)}
           src={src}
         />
