@@ -133,7 +133,17 @@ async def _owned_mutation(authority, actor, ref, params):
                     raise
                 from gateway.session_deferred_pick import defer_pick
                 # Its own BEGIN IMMEDIATE: off the loop, like the receipt commit.
-                return await asyncio.to_thread(defer_pick, authority, actor, ref, params)
+                result = await asyncio.to_thread(defer_pick, authority, actor, ref, params)
+                # A quota wait has no provider request or tool in flight. A manual pick
+                # cancels that pending retry; ordinary running turns keep their route.
+                agent = authority.agent(ref)
+                if getattr(agent, '_quota_wait_active', False) is True:
+                    try:
+                        await authority.interrupt(actor, ref, result['execution_generation'])
+                    except RuntimeStoreError as stop_error:
+                        if stop_error.reason != 'stale_generation':
+                            raise
+                return result
     if params.get('operation') in {*_POLICY, 'compress', 'reset'} and not is_chat_pick(live, params['operation']):
         authority._schedule(ref)
     return result

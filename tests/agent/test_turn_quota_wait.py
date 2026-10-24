@@ -87,7 +87,7 @@ def test_quota_error_waits_until_reset_and_reenters_without_fallback():
     agent, waited = _Agent(fallback_left=True), []
     verdict, retry = _route(agent, _QuotaErr(300), sleep=lambda a, w, *x, **k: waited.append(w))
     assert verdict.action == "continue" and verdict.result is None
-    assert 299 <= waited[0] <= 310          # earliest reset (+ small margin)
+    assert 299 <= waited[0] <= 335          # earliest reset (+ small margin)
     assert agent.activated == []            # no silent model/provider switch
     assert retry.quota_waits_used == 1
     assert verdict.retry_count == 1         # the wait does not burn a retry
@@ -162,3 +162,41 @@ def test_reset_time_without_safe_flag_is_not_waited_on():
     err.safe_to_resume = False
     _route(agent, err, sleep=lambda a, w, *x, **k: waited.append(w))
     assert waited == []
+
+
+def test_wait_is_visible_to_model_switch_and_cleared_after_stop():
+    agent = _Agent()
+
+    def stop(a, wait, retry, **kw):
+        assert a._quota_wait_active is True
+        return {'interrupted': True}
+
+    verdict, _ = _route(agent, _QuotaErr(300), sleep=stop)
+    assert verdict.action == 'return'
+    assert agent._quota_wait_active is False
+
+
+def test_weekly_exhaustion_stops_without_falling_to_another_model():
+    agent = _Agent()
+    verdict, _ = _route(agent, _QuotaErr(7 * 86400))
+    assert agent.activated == []
+    assert verdict.action == 'return'
+    assert verdict.result['failed'] is True
+    assert verdict.result['failure_resets_at'] > time.time()
+
+
+def test_quota_resets_stagger_wakes_between_sessions():
+    agent, waited = _Agent(), []
+    err = _QuotaErr(300)
+    with patch('agent.turn_quota_wait.time.time', return_value=1000), patch('random.uniform', return_value=17):
+        err.quota_reset_at = 1300
+        _route(agent, err, sleep=lambda a, w, *x, **k: waited.append(w))
+    assert waited == [317]
+
+
+def test_wait_marker_is_set_before_publishing_the_wait_notice():
+    agent = _Agent()
+    seen = []
+    agent._emit_diagnostic_status = lambda t: seen.append(getattr(agent, '_quota_wait_active', False))
+    _route(agent, _QuotaErr(300), sleep=lambda *a, **kw: None)
+    assert seen == [True]
