@@ -1907,6 +1907,15 @@ def route_classified_error(
                 return _verdict("break")
         # Compression exhausted or didn't help: fall through to normal error handling.
 
+    # Provider-typed, before-output quota wait: park only this pending request until the reset.
+    # Runs before eager fallback so a plan limit never switches model; unmarked errors skip it.
+    from agent.turn_quota_wait import wait_for_quota_reset
+    _quota = wait_for_quota_reset(
+        agent, api_error, _retry, messages=messages, conversation_history=conversation_history,
+        api_call_count=api_call_count)
+    if _quota is not None:
+        return _verdict(_quota["action"], _quota["result"])
+
     # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
     # the retry window); transport errors get 1 retry first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS

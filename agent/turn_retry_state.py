@@ -48,6 +48,8 @@ class TurnRetryState:
     auth_failover_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
+    # Typed quota waits (agent/turn_quota_wait.py) spent on this API call.
+    quota_waits_used: int = 0
 
     # Restart signals (read by the outer loop after the attempt)
     restart_with_compressed_messages: bool = False

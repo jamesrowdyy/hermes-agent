@@ -1451,6 +1451,12 @@ def _apply_agent_section(agent, _agent_cfg):
         agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
     except (TypeError, ValueError):
         agent._auto_recovery_cycles = 5
+    # Typed quota wait-and-resume (agent/turn_quota_wait.py): max waits per request, longest wait (s).
+    try:
+        agent._quota_wait_cycles = max(int(_agent_section.get("quota_wait_cycles", 3)), 0)
+        agent._quota_wait_max_s = max(float(_agent_section.get("quota_wait_max_s", 6 * 3600)), 0.0)
+    except (TypeError, ValueError):
+        agent._quota_wait_cycles, agent._quota_wait_max_s = 3, 6 * 3600.0
 
 
 def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
